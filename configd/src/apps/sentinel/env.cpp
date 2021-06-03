@@ -31,6 +31,7 @@ Env::Env()
     _statePort(0)
 {
     _startMetrics.startedTime = vespalib::steady_clock::now();
+    _stateApi.myHealth.setFailed("initializing...");
 }
 
 Env::~Env() = default;
@@ -46,9 +47,8 @@ void Env::boot(const std::string &configId) {
         configId.c_str(), cfg.port.telnet, cfg.port.rpc);
     rpcPort(cfg.port.rpc);
     statePort(cfg.port.telnet);
-    if (auto up = ConfigOwner::fetchModelConfig(MODEL_TIMEOUT_MS)) {
-        waitForConnectivity(*up);
-    }
+    waitForConnectivity();
+    _stateApi.myHealth.setOk();
 }
 
 void Env::rpcPort(int port) {
@@ -132,9 +132,29 @@ std::map<std::string, std::string> specsFrom(const ModelConfig &model) {
 
 }
 
-void Env::waitForConnectivity(const ModelConfig &model) {
+void Env::waitForConnectivity() {
+    for (int retry = 1; retry < 100; ++retry) {
+        auto up = ConfigOwner::fetchModelConfig(MODEL_TIMEOUT_MS);
+        if (! up) {
+            LOG(warning, "could not get model config, skipping connectivity checks");
+            return;
+        }
+        if (checkConnectivity(*up)) {
+            LOG(info, "Connectivity check OK, proceeding with service startup");
+            return;
+        }
+        LOG(warning, "Connectivity check FAILED (try %d)", retry);
+        _stateApi.myHealth.setFailed("FAILED connectivity check");
+        respondAsEmpty();
+        std::this_thread::sleep_for(1s);
+    }
+    throw InvalidConfigException("Giving up - too many connectivity check failures");
+}
+
+bool Env::checkConnectivity(const ModelConfig &model) {
     auto checkSpecs = specsFrom(model);
-    OutwardCheckContext checkContext(checkSpecs.size(),
+    size_t clusterSize = checkSpecs.size();
+    OutwardCheckContext checkContext(clusterSize,
                                      vespa::Defaults::vespaHostname(),
                                      _rpcServer->getPort(),
                                      _rpcServer->orb());
@@ -143,10 +163,40 @@ void Env::waitForConnectivity(const ModelConfig &model) {
         connectivityMap.try_emplace(hn, spec, checkContext);
     }
     checkContext.latch.await();
+    size_t numFailedConns = 0;
+    size_t numFailedReverse = 0;
     for (const auto & [hostname, check] : connectivityMap) {
-        LOG(info, "outward check status for host %s is: %s",
-            hostname.c_str(), toString(check.result()));
+        if (check.result() == CcResult::CONN_FAIL) ++numFailedConns;
+        if (check.result() == CcResult::REVERSE_FAIL) ++numFailedReverse;
     }
+    const auto & cfg = _cfgOwner.getConfig();
+    bool allChecksOk = true;
+    LOG(config, "connectivity.allowedBadReversePercent = %d", cfg.connectivity.allowedBadReversePercent);
+    LOG(config, "connectivity.allowedBadReverseCount = %d", cfg.connectivity.allowedBadReverseCount);
+    LOG(config, "connectivity.allowedBadOutPercent = %d", cfg.connectivity.allowedBadOutPercent);
+    if (numFailedReverse * 100ul > cfg.connectivity.allowedBadReversePercent * clusterSize) {
+        double pct = numFailedReverse * 100.0 / clusterSize;
+        LOG(error, "%zu of %zu nodes report problems connecting to me, %.2f %% (max is %d)",
+            numFailedReverse, clusterSize, pct, cfg.connectivity.allowedBadReversePercent);
+        allChecksOk = false;
+    }
+    if (numFailedReverse > size_t(cfg.connectivity.allowedBadReverseCount)) {
+        LOG(error, "%zu of %zu nodes report problems connecting to me (max is %d)",
+            numFailedReverse, clusterSize, cfg.connectivity.allowedBadReverseCount);
+        allChecksOk = false;
+    }
+    if (numFailedConns * 100ul > cfg.connectivity.allowedBadOutPercent * clusterSize) {
+        double pct = numFailedConns * 100ul / clusterSize;
+        LOG(error, "Problems connecting to %zu of %zu nodes, %.2f %% (max is %d)",
+            numFailedConns, clusterSize, pct, cfg.connectivity.allowedBadOutPercent);
+        allChecksOk = false;
+    }
+    if (! allChecksOk) {
+        for (const auto & [hostname, check] : connectivityMap) {
+            LOG(info, "connectivity check for %s -> %s", hostname.c_str(), toString(check.result()));
+        }
+    }
+    return allChecksOk;
 }
 
 }
