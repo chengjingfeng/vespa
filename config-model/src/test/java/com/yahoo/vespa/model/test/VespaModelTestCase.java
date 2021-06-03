@@ -306,7 +306,7 @@ public class VespaModelTestCase {
     }
 
     @Test
-    public void testThatDeployLogContainsWarninnWhenUsingSearchdefinitionsDir() throws IOException, SAXException {
+    public void testThatDeployLogContainsWarningWhenUsingSearchdefinitionsDir() throws IOException, SAXException {
         ApplicationPackage app = FilesApplicationPackage.fromFile(
                 new File("src/test/cfg/application/app_qrserverandgw/"));
         MyLogger logger = new MyLogger();
@@ -317,9 +317,16 @@ public class VespaModelTestCase {
         VespaModel model = new VespaModel(new NullConfigModelRegistry(), deployState);
         Validation.validate(model, new ValidationParameters(), deployState);
 
-        assertEquals(3, logger.msgs.size());
-        assertEquals("WARNING", logger.msgs.get(1).getFirst().getName());
-        assertEquals("Directory searchdefinitions/ should not be used for schemas, use schemas/ instead", logger.msgs.get(1).getSecond());
+        boolean foundCorrectWarning = false;
+        for (var msg : logger.msgs)
+            if (msg.getFirst().getName().equals("WARNING") &&
+                msg.getSecond().equals("Directory searchdefinitions/ should not be used for schemas, use schemas/ instead"))
+            {
+                foundCorrectWarning = true;
+            }
+        if (! foundCorrectWarning) for (var msg : logger.msgs) System.err.println("MSG: "+msg);
+        assertTrue(logger.msgs.size() > 0);
+        assertTrue(foundCorrectWarning);
     }
 
 }
