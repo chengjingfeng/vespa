@@ -80,6 +80,21 @@ public class ConfigSentinel extends AbstractService implements SentinelConfig.Pr
                 builder.service(getServiceConfig(s));
             }
         }
+        builder.connectivity(getConnectivityConfig(requireConnectivityCheck));
+    }
+
+    private SentinelConfig.Connectivity.Builder getConnectivityConfig(boolean enable) {
+        var builder = new SentinelConfig.Connectivity.Builder();
+        if (enable) {
+            builder.allowedBadOutPercent(80);
+            builder.allowedBadReversePercent(20);
+            builder.allowedBadReverseCount(2);
+        } else {
+            builder.allowedBadOutPercent(100);
+            builder.allowedBadReversePercent(100);
+            builder.allowedBadReverseCount(Integer.MAX_VALUE);
+        }
+        return builder;
     }
 
     private SentinelConfig.Application.Builder getApplicationConfig() {
