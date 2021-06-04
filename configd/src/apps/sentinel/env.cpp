@@ -53,7 +53,7 @@ void Env::boot(const std::string &configId) {
     LOG(debug, "Reading configuration for ID: %s", configId.c_str());
     _cfgOwner.subscribe(configId, CONFIG_TIMEOUT_MS);
     // subscribe() should throw if something is not OK
-    for (int retry = 1; retry <= 5; ++retry) {
+    for (int retry = 0; retry < maxRetryLoops; ++retry) {
         _cfgOwner.checkForConfigUpdate();
         LOG_ASSERT(_cfgOwner.hasConfig());
         const auto & cfg = _cfgOwner.getConfig();
@@ -64,7 +64,7 @@ void Env::boot(const std::string &configId) {
         if (waitForConnectivity(retry)) {
             _stateApi.myHealth.setOk();
             return;
-        } else if (retry < 5) {
+        } else {
             LOG(warning, "Bad network connectivity, retry from start");
         }
     }
@@ -121,13 +121,13 @@ bool Env::waitForConnectivity(int outerRetry) {
         return true;
     }
     Connectivity checker(_cfgOwner.getConfig().connectivity, *_rpcServer);
-    for (int retry = 1; retry <= 10; ++retry) {
+    for (int retry = 0; retry < maxRetriesInsideLoop; ++retry) {
         auto res = checker.checkConnectivity(*up);
         if (res.ok) {
             LOG(info, "Connectivity check OK, proceeding with service startup");
             return true;
         }
-        LOG(warning, "Connectivity check FAILED (try %d)", retry + 10 * outerRetry);
+        LOG(warning, "Connectivity check FAILED (try %d)", 1 + retry + maxRetriesInsideLoop*outerRetry);
         _stateApi.myHealth.setFailed("FAILED connectivity check");
         if (lastCheckResult.details != res.details) {
             for (const std::string &detail : res.details) {
@@ -135,7 +135,7 @@ bool Env::waitForConnectivity(int outerRetry) {
             }
             lastCheckResult = std::move(res);
         }
-        for (int i = 0; i < outerRetry; ++i) {
+        for (int i = 0; i <= outerRetry; ++i) {
             respondAsEmpty();
             maybeStopNow();
             std::this_thread::sleep_for(1s);
