@@ -52,16 +52,23 @@ Env::~Env() = default;
 void Env::boot(const std::string &configId) {
     LOG(debug, "Reading configuration for ID: %s", configId.c_str());
     _cfgOwner.subscribe(configId, CONFIG_TIMEOUT_MS);
-    bool ok = _cfgOwner.checkForConfigUpdate();
     // subscribe() should throw if something is not OK
-    LOG_ASSERT(ok && _cfgOwner.hasConfig());
-    const auto & cfg = _cfgOwner.getConfig();
-    LOG(config, "Booting sentinel '%s' with [stateserver port %d] and [rpc port %d]",
-        configId.c_str(), cfg.port.telnet, cfg.port.rpc);
-    rpcPort(cfg.port.rpc);
-    statePort(cfg.port.telnet);
-    waitForConnectivity();
-    _stateApi.myHealth.setOk();
+    for (int retry = 1; retry <= 5; ++retry) {
+        _cfgOwner.checkForConfigUpdate();
+        LOG_ASSERT(_cfgOwner.hasConfig());
+        const auto & cfg = _cfgOwner.getConfig();
+        LOG(config, "Booting sentinel '%s' with [stateserver port %d] and [rpc port %d]",
+            configId.c_str(), cfg.port.telnet, cfg.port.rpc);
+        rpcPort(cfg.port.rpc);
+        statePort(cfg.port.telnet);
+        if (waitForConnectivity(retry)) {
+            _stateApi.myHealth.setOk();
+            return;
+        } else if (retry < 5) {
+            LOG(warning, "Bad network connectivity, retry from start");
+        }
+    }
+    throw InvalidConfigException("Giving up - too many connectivity check failures");
 }
 
 void Env::rpcPort(int port) {
@@ -106,21 +113,21 @@ void Env::respondAsEmpty() {
     }
 }
 
-void Env::waitForConnectivity() {
+bool Env::waitForConnectivity(int outerRetry) {
     Connectivity::CheckResult lastCheckResult;
     auto up = ConfigOwner::fetchModelConfig(MODEL_TIMEOUT_MS);
     if (! up) {
         LOG(warning, "could not get model config, skipping connectivity checks");
-        return;
+        return true;
     }
     Connectivity checker(_cfgOwner.getConfig().connectivity, *_rpcServer);
-    for (int retry = 1; retry < 100; ++retry) {
+    for (int retry = 1; retry <= 10; ++retry) {
         auto res = checker.checkConnectivity(*up);
         if (res.ok) {
             LOG(info, "Connectivity check OK, proceeding with service startup");
-            return;
+            return true;
         }
-        LOG(warning, "Connectivity check FAILED (try %d)", retry);
+        LOG(warning, "Connectivity check FAILED (try %d)", retry + 10 * outerRetry);
         _stateApi.myHealth.setFailed("FAILED connectivity check");
         if (lastCheckResult.details != res.details) {
             for (const std::string &detail : res.details) {
@@ -128,11 +135,13 @@ void Env::waitForConnectivity() {
             }
             lastCheckResult = std::move(res);
         }
-        respondAsEmpty();
-        maybeStopNow();
-        std::this_thread::sleep_for(1s);
+        for (int i = 0; i < outerRetry; ++i) {
+            respondAsEmpty();
+            maybeStopNow();
+            std::this_thread::sleep_for(1s);
+        }
     }
-    throw InvalidConfigException("Giving up - too many connectivity check failures");
+    return false;
 }
 
 }

@@ -32,7 +32,7 @@ public:
     void notifyConfigUpdated();
 private:
     void respondAsEmpty();
-    void waitForConnectivity();
+    bool waitForConnectivity(int outerRetry);
     ConfigOwner _cfgOwner;
     CommandQueue _rpcCommandQueue;
     std::unique_ptr<RpcServer> _rpcServer;
