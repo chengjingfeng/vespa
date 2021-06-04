@@ -2,11 +2,12 @@
 
 #include "env.h"
 #include "check-completion-handler.h"
-#include "outward-check.h"
+#include "connectivity.h"
 #include <vespa/defaults.h>
 #include <vespa/log/log.h>
 #include <vespa/config/common/exceptions.h>
 #include <vespa/vespalib/util/exceptions.h>
+#include <vespa/vespalib/util/signalhandler.h>
 #include <vespa/vespalib/util/stringfmt.h>
 #include <thread>
 #include <chrono>
@@ -18,8 +19,20 @@ using namespace std::chrono_literals;
 
 namespace config::sentinel {
 
+namespace {
+
+void maybeStopNow() {
+    if (vespalib::SignalHandler::INT.check() ||
+        vespalib::SignalHandler::TERM.check())
+    {
+        throw vespalib::FatalException("got signal during boot()");
+    }
+}
+
 constexpr std::chrono::milliseconds CONFIG_TIMEOUT_MS = 3min;
 constexpr std::chrono::milliseconds MODEL_TIMEOUT_MS = 1500ms;
+
+} // namespace <unnamed>
 
 Env::Env()
   : _cfgOwner(),
@@ -93,110 +106,33 @@ void Env::respondAsEmpty() {
     }
 }
 
-namespace {
-
-const char *toString(CcResult value) {
-    switch (value) {
-        case CcResult::UNKNOWN: return "unknown";
-        case CcResult::CONN_FAIL: return "failed to connect";
-        case CcResult::REVERSE_FAIL: return "connect OK, but reverse check FAILED";
-        case CcResult::REVERSE_UNAVAIL: return "connect OK, but reverse check unavailable";
-        case CcResult::ALL_OK: return "both ways connectivity OK";
-    }
-    LOG(error, "Unknown CcResult enum value: %d", (int)value);
-    LOG_ABORT("Unknown CcResult enum value");
-}
-
-std::map<std::string, std::string> specsFrom(const ModelConfig &model) {
-    std::map<std::string, std::string> checkSpecs;
-    for (const auto & h : model.hosts) {
-        bool foundSentinelPort = false;
-        for (const auto & s : h.services) {
-            if (s.name == "config-sentinel") {
-                for (const auto & p : s.ports) {
-                    if (p.tags.find("rpc") != p.tags.npos) {
-                        auto spec = fmt("tcp/%s:%d", h.name.c_str(), p.number);
-                        checkSpecs[h.name] = spec;
-                        foundSentinelPort = true;
-                    }
-                }
-            }
-        }
-        if (! foundSentinelPort) {
-            LOG(warning, "Did not find 'config-sentinel' RPC port in model for host %s [%zd services]",
-                h.name.c_str(), h.services.size());
-        }
-    }
-    return checkSpecs;
-}
-
-}
-
 void Env::waitForConnectivity() {
+    Connectivity::CheckResult lastCheckResult;
+    auto up = ConfigOwner::fetchModelConfig(MODEL_TIMEOUT_MS);
+    if (! up) {
+        LOG(warning, "could not get model config, skipping connectivity checks");
+        return;
+    }
+    Connectivity checker(_cfgOwner.getConfig().connectivity, *_rpcServer);
     for (int retry = 1; retry < 100; ++retry) {
-        auto up = ConfigOwner::fetchModelConfig(MODEL_TIMEOUT_MS);
-        if (! up) {
-            LOG(warning, "could not get model config, skipping connectivity checks");
-            return;
-        }
-        if (checkConnectivity(*up)) {
+        auto res = checker.checkConnectivity(*up);
+        if (res.ok) {
             LOG(info, "Connectivity check OK, proceeding with service startup");
             return;
         }
         LOG(warning, "Connectivity check FAILED (try %d)", retry);
         _stateApi.myHealth.setFailed("FAILED connectivity check");
+        if (lastCheckResult.details != res.details) {
+            for (const std::string &detail : res.details) {
+                LOG(info, "Connectivity check details: %s", detail.c_str());
+            }
+            lastCheckResult = std::move(res);
+        }
         respondAsEmpty();
+        maybeStopNow();
         std::this_thread::sleep_for(1s);
     }
     throw InvalidConfigException("Giving up - too many connectivity check failures");
-}
-
-bool Env::checkConnectivity(const ModelConfig &model) {
-    auto checkSpecs = specsFrom(model);
-    size_t clusterSize = checkSpecs.size();
-    OutwardCheckContext checkContext(clusterSize,
-                                     vespa::Defaults::vespaHostname(),
-                                     _rpcServer->getPort(),
-                                     _rpcServer->orb());
-    std::map<std::string, OutwardCheck> connectivityMap;
-    for (const auto & [ hn, spec ] : checkSpecs) {
-        connectivityMap.try_emplace(hn, spec, checkContext);
-    }
-    checkContext.latch.await();
-    size_t numFailedConns = 0;
-    size_t numFailedReverse = 0;
-    for (const auto & [hostname, check] : connectivityMap) {
-        if (check.result() == CcResult::CONN_FAIL) ++numFailedConns;
-        if (check.result() == CcResult::REVERSE_FAIL) ++numFailedReverse;
-    }
-    const auto & cfg = _cfgOwner.getConfig();
-    bool allChecksOk = true;
-    LOG(config, "connectivity.allowedBadReversePercent = %d", cfg.connectivity.allowedBadReversePercent);
-    LOG(config, "connectivity.allowedBadReverseCount = %d", cfg.connectivity.allowedBadReverseCount);
-    LOG(config, "connectivity.allowedBadOutPercent = %d", cfg.connectivity.allowedBadOutPercent);
-    if (numFailedReverse * 100ul > cfg.connectivity.allowedBadReversePercent * clusterSize) {
-        double pct = numFailedReverse * 100.0 / clusterSize;
-        LOG(error, "%zu of %zu nodes report problems connecting to me, %.2f %% (max is %d)",
-            numFailedReverse, clusterSize, pct, cfg.connectivity.allowedBadReversePercent);
-        allChecksOk = false;
-    }
-    if (numFailedReverse > size_t(cfg.connectivity.allowedBadReverseCount)) {
-        LOG(error, "%zu of %zu nodes report problems connecting to me (max is %d)",
-            numFailedReverse, clusterSize, cfg.connectivity.allowedBadReverseCount);
-        allChecksOk = false;
-    }
-    if (numFailedConns * 100ul > cfg.connectivity.allowedBadOutPercent * clusterSize) {
-        double pct = numFailedConns * 100ul / clusterSize;
-        LOG(error, "Problems connecting to %zu of %zu nodes, %.2f %% (max is %d)",
-            numFailedConns, clusterSize, pct, cfg.connectivity.allowedBadOutPercent);
-        allChecksOk = false;
-    }
-    if (! allChecksOk) {
-        for (const auto & [hostname, check] : connectivityMap) {
-            LOG(info, "connectivity check for %s -> %s", hostname.c_str(), toString(check.result()));
-        }
-    }
-    return allChecksOk;
 }
 
 }

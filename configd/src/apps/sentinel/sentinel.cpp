@@ -65,6 +65,10 @@ main(int argc, char **argv)
     LOG(debug, "Reading configuration");
     try {
         environment.boot(configId);
+    } catch (vespalib::FatalException& ex) {
+        LOG(error, "Stopping before boot complete: %s", ex.message());
+        EV_STOPPING("config-sentinel", ex.message());
+        return EXIT_FAILURE;
     } catch (ConfigTimeoutException & ex) {
         LOG(warning, "Timeout getting config, please check your setup. Will exit and restart: %s", ex.message());
         EV_STOPPING("config-sentinel", ex.message());

@@ -33,7 +33,6 @@ public:
 private:
     void respondAsEmpty();
     void waitForConnectivity();
-    bool checkConnectivity(const ModelConfig &model);
     ConfigOwner _cfgOwner;
     CommandQueue _rpcCommandQueue;
     std::unique_ptr<RpcServer> _rpcServer;
