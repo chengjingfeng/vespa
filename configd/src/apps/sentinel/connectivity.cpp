@@ -31,11 +31,11 @@ namespace {
 
 const char *toString(CcResult value) {
     switch (value) {
-        case CcResult::UNKNOWN: return "unknown";
-        case CcResult::CONN_FAIL: return "failed to connect";
-        case CcResult::REVERSE_FAIL: return "connect OK, but reverse check FAILED";
-        case CcResult::REVERSE_UNAVAIL: return "connect OK, but reverse check unavailable";
-        case CcResult::ALL_OK: return "OK: both ways connectivity verified";
+        case CcResult::UNKNOWN: return "BAD: missing result"; // very very bad
+        case CcResult::REVERSE_FAIL: return "connect OK, but reverse check FAILED"; // very bad
+        case CcResult::CONN_FAIL: return "failed to connect"; // bad
+        case CcResult::REVERSE_UNAVAIL: return "connect OK (but reverse check unavailable)"; // unfortunate
+        case CcResult::ALL_OK: return "OK: both ways connectivity verified"; // good
     }
     LOG(error, "Unknown CcResult enum value: %d", (int)value);
     LOG_ABORT("Unknown CcResult enum value");
@@ -82,25 +82,29 @@ Connectivity::checkConnectivity(const ModelConfig &model) {
     checkContext.latch.await();
     size_t numFailedConns = 0;
     size_t numFailedReverse = 0;
+    bool allChecksOk = true;
     for (const auto & [hostname, check] : connectivityMap) {
         if (check.result() == CcResult::CONN_FAIL) ++numFailedConns;
         if (check.result() == CcResult::REVERSE_FAIL) ++numFailedReverse;
+        if (check.result() == CcResult::UNKNOWN) {
+            LOG(error, "Missing ConnectivityCheck result from %s", hostname.c_str());
+            allChecksOk = false;
+        }
     }
-    bool allChecksOk = true;
     if (numFailedReverse * 100ul > _config.allowedBadReversePercent * clusterSize) {
         double pct = numFailedReverse * 100.0 / clusterSize;
-        LOG(error, "%zu of %zu nodes report problems connecting to me, %.2f %% (max is %d)",
+        LOG(warning, "%zu of %zu nodes report problems connecting to me, %.2f %% (max is %d)",
             numFailedReverse, clusterSize, pct, _config.allowedBadReversePercent);
         allChecksOk = false;
     }
     if (numFailedReverse > size_t(_config.allowedBadReverseCount)) {
-        LOG(error, "%zu of %zu nodes report problems connecting to me (max is %d)",
+        LOG(warning, "%zu of %zu nodes report problems connecting to me (max is %d)",
             numFailedReverse, clusterSize, _config.allowedBadReverseCount);
         allChecksOk = false;
     }
     if (numFailedConns * 100ul > _config.allowedBadOutPercent * clusterSize) {
         double pct = numFailedConns * 100ul / clusterSize;
-        LOG(error, "Problems connecting to %zu of %zu nodes, %.2f %% (max is %d)",
+        LOG(warning, "Problems connecting to %zu of %zu nodes, %.2f %% (max is %d)",
             numFailedConns, clusterSize, pct, _config.allowedBadOutPercent);
         allChecksOk = false;
     }
